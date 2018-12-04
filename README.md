@@ -20,12 +20,12 @@ Executors act separately, so that each one keeps its own statistics and predicat
 
 ## Configuration options
 
-`k`, `n` and `n` are configurable via configuration options `spark.sql.adaptiveFilter.collectRate`, `spark.sql.adaptiveFilter.calculateRate` and `spark.sql.adaptiveFilter.momentum` respectively. Generally the following configuration options are available:
+`k`, `n` and `m` are configurable via configuration options `spark.sql.adaptiveFilter.collectRate`, `spark.sql.adaptiveFilter.calculateRate` and `spark.sql.adaptiveFilter.momentum` respectively. Generally the following configuration options are available:
 
 | Name 											| Default value | Description 
 |-----------------------------------------------|---------------|-------------
 | `spark.sql.adaptiveFilter.enabled`   			| `true`        | Enables adaptive extension.
-| `spark.sql.adaptiveFilter.verbose`   			| `false`       | Enables verbose mode. Information about predicates statistics and ranks will be produced in executors' outputs.
+| `spark.sql.adaptiveFilter.verbose`   			| `false`       | Enables verbose mode. Information about predicates statistics and ranks will be produced in executors' stdouts.
 | `spark.sql.adaptiveFilter.collectRate`     	| 1000          | Statistics collection rate (in rows)
 | `spark.sql.adaptiveFilter.calculateRate`     	| 1000000       | Ranks calculation rate (in rows)
 | `spark.sql.adaptiveFilter.momentum` 			| 0.3           | Previous rank preservation factor (range [0,1])
@@ -43,7 +43,7 @@ sbt clean package
 
 Start Spark shell/submit adding the generated package and the following extension injector:
 ```
-./$SPARK_HOME/bin/spark-shell --jars target/scala-2.11/spark-adaptive_filtering_2.11-0.1-SNAPSHOT.jar \
+$SPARK_HOME/bin/spark-shell --jars target/scala-2.11/spark-adaptive_filtering_2.11-0.1-SNAPSHOT.jar \
 --conf "spark.sql.extensions=gr.auth.csd.datalab.spark.sql.AdaptiveFilterExtensionInjector" \
 # set master and other configurations...
 ```
