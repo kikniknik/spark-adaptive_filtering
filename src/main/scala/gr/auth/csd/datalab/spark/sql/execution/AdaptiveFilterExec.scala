@@ -9,21 +9,29 @@ import org.apache.spark.sql.catalyst.plans.physical.Partitioning
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
 import org.apache.spark.sql.execution.{CodegenSupport, FilterExec, SparkPlan, UnaryExecNode}
 
+/**
+  Physical plan for Filter operator. This class is a copy of `FilterExec`, except
+  `doConsume` method which inserts adaptive predicate reordering, instead of
+  static user predefined predicate order that is used in `FilterExec`.
+ */
 case class AdaptiveFilterExec(condition: Expression, child: SparkPlan)
   extends UnaryExecNode with CodegenSupport with PredicateHelper {
 
+  // `FilterExec` doc:
   // Split out all the IsNotNulls from condition.
   private val (notNullPreds, otherPreds) = splitConjunctivePredicates(condition).partition {
     case IsNotNull(a) => isNullIntolerant(a) && a.references.subsetOf(child.outputSet)
     case _ => false
   }
 
+  // `FilterExec` doc:
   // If one expression and its children are null intolerant, it is null intolerant.
   private def isNullIntolerant(expr: Expression): Boolean = expr match {
     case e: NullIntolerant => e.children.forall(isNullIntolerant)
     case _ => false
   }
 
+  // `FilterExec` doc:
   // The columns that will filtered out by `IsNotNull` could be considered as not nullable.
   private val notNullAttributes = notNullPreds.flatMap(_.references).distinct.map(_.exprId)
 
@@ -54,18 +62,15 @@ case class AdaptiveFilterExec(condition: Expression, child: SparkPlan)
 
     // configurations
     val conf = SparkEnv.get.conf
-    val debug = conf.getBoolean("spark.sql.adaptiveFilter.verbose", false)
+    val verbose = conf.getBoolean("spark.sql.adaptiveFilter.verbose", false)
     val collectRate = conf.getInt("spark.sql.adaptiveFilter.collectRate", 1000)
     val calculateRate = conf.getInt("spark.sql.adaptiveFilter.calculateRate", 1000000)
     val momentum = conf.getDouble("spark.sql.adaptiveFilter.momentum", 0.3)
 
     val numOutput = metricTerm(ctx, "numOutputRows")
 
-    // genPredicate stopStatement
-    val stopStatement = "return false"
-
     /**
-      * `doConsume` doc:
+      * FilterExec doc:
       * Generates code for `c`, using `in` for input attributes and `attrs` for nullability.
       */
     def genPredicate(c: Expression, in: Seq[ExprCode], attrs: Seq[Attribute]): String = {
@@ -83,31 +88,13 @@ case class AdaptiveFilterExec(condition: Expression, child: SparkPlan)
       s"""
          |$evaluated
          |${ev.code}
-         |if (${nullCheck}!${ev.value}) $stopStatement;
+         |if (${nullCheck}!${ev.value}) return false;
        """.stripMargin
     }
 
     ctx.currentVars = input
 
-
-    val prereq = {
-      val declared = ctx.mutableStates.map(_._2)
-      val allpossible = input.head.code.split("\n", 3)(1).split(" = ").last.split('.')
-      if (!declared.contains(allpossible(0))) {
-        ctx.addMutableState("InternalRow", allpossible(0), "")
-        allpossible(0)
-      } else {
-        val Pattern = raw"[(](\w.*)[)]".r.unanchored
-        allpossible(1) match {
-          case Pattern(value) =>
-            ctx.addMutableState("int", value, "")
-            value
-          case _ => ""
-        }
-      }
-    }
-
-    // `doConsume` comment:
+    // `FilterExec` comment:
     // To generate the predicates we will follow this algorithm.
     // For each predicate that is not IsNotNull, we will generate them one by one loading attributes
     // as necessary. For each of both attributes, if there is an IsNotNull predicate we will
@@ -130,7 +117,7 @@ case class AdaptiveFilterExec(condition: Expression, child: SparkPlan)
         val idx = notNullPreds.indexWhere { n => n.asInstanceOf[IsNotNull].child.semanticEquals(r) }
         if (idx != -1 && !generatedIsNotNullChecks(idx)) {
           generatedIsNotNullChecks(idx) = true
-          // `doConsume` comment:
+          // `FilterExec` comment:
           // Use the child's output. The nullability is what the child produced.
           genPredicate(notNullPreds(idx), input_copy, child.output)
         } else {
@@ -138,7 +125,7 @@ case class AdaptiveFilterExec(condition: Expression, child: SparkPlan)
         }
       }.mkString("\n").trim
 
-      // `doConsume` comment:
+      // `FilterExec` comment:
       // Here we use *this* operator's output with this output's nullability since we already
       // enforced them with the IsNotNull checks above.
       s"""
@@ -147,21 +134,25 @@ case class AdaptiveFilterExec(condition: Expression, child: SparkPlan)
        """.stripMargin.trim
     }
 
-    // adaptive metrics
-    // numInputRows: long, number of input rows in general. This is identical to scanOutputRows,
-    //               if scan is preceding
-    // numSeen, numCut: long arrays, in each place they have number of rows seen and cut for
-    //                  corresponding predicate
-    // cost: long array, in each place it has time that took a predicate to finish
+    // Adaptive metrics and variables
+    // `numInputRows`: number of input rows in general. This is identical to scanOutputRows,
+    //                 if scan is preceding
+    // `numSeen`, `numCut`: arrays holding number of rows seen and cut for a round for each predicate
+    // `cost`: array holding total evaluation times for a round for each predicate
     //
-    // performance: static long array, it keeps performances of predicates based on numSeen, numCut
-    //               It is updated based on calculateRate conf. It's static, that means it is
-    //               shared among all Tasks in an Executor.
+    // `ranks`: static array, that keeps ranks of predicates which are calculated based on numSeen, numCut
+    //          It is updated based on calculateRate conf option.
+    // `permutation`: static array, it keeps a permutation of predicates based on their
+    //                 ranks at that moment
+    // `ranks` and `permutation` are static, which means they are shared among all Tasks in an Executor.
+    // We do it like that so that new Tasks won't have to start from zero in metrics.
     val numInputRows = ctx.freshName("numInputRows")
     val numSeen = ctx.freshName("numSeen")
     val numCut = ctx.freshName("numCut")
     val cost = ctx.freshName("cost")
-    val performance = ctx.freshName("performance")
+    val ranks = ctx.freshName("ranks")
+    val permutation = ctx.freshName("p")
+
     ctx.addMutableState("long", numInputRows, s"$numInputRows = 0;")
     ctx.addMutableState("long[]", numSeen,
       s"$numSeen = new long[]{${Array.fill(otherPreds.length)(1).mkString(", ")}};")
@@ -170,75 +161,52 @@ case class AdaptiveFilterExec(condition: Expression, child: SparkPlan)
     ctx.addMutableState("long[]", cost,
       s"$cost = new long[]{${Array.fill(otherPreds.length)(60).mkString(", ")}};")
     ctx.addMutableState("static double[]",
-      s"$performance = new double[]{${Array.fill(otherPreds.length)(0).mkString(", ")}};", "")
-    // s"$performance = new double[]{${Array.fill(otherPreds.length)(0).mkString(", ")}};")
-
-    // permutations: static int array, it keeps a permutation of predicates based on their
-    //               performance at that moment
-    val permutations = ctx.freshName("p")
+      s"$ranks = new double[]{${Array.fill(otherPreds.length)(0).mkString(", ")}};", "")
     ctx.addMutableState("static int[]",
-      s"$permutations = new int[]{${otherPreds.indices.mkString(", ")}};", "")
+      s"$permutation = new int[]{${otherPreds.indices.mkString(", ")}};", "")
 
-    // collect, calculate performance rates
+    // collect, calculate ranks rates
     val itsTimeToCalculate = s"$numInputRows % $calculateRate == ${30*collectRate}"
     val itsTimeToCollect = s"$numInputRows % $collectRate == 0"
-    // canCalculate: a lock for preventing Tasks to conflict in performances calculations
+    // `canCalculate`: a lock for preventing Tasks to conflict in ranks calculations
     val canCalculate = ctx.freshName("canCalculate")
     ctx.addMutableState("static boolean", s"$canCalculate = true;", "")
 
-    // choosePredicate: function that will evaluate a predicate, based on its argument.
-    //                  e.g. for evaluating second predicate => choosePredicate(1)
-    val choosePredName = ctx.freshName("choosePredicate")
 
-    val choosePredBody = generatedSeq.zipWithIndex.map { case (predicate, i) =>
-      s"""
-         |case $i: {
-         |  $predicate
-         |  return true;
-         |}
-       """.stripMargin
-    }
-    val choosePredCode =
-      s"""
-         |private final Boolean $choosePredName(int index) {
-         |  switch (index) {
-         |    ${choosePredBody.mkString("\n")}
-         |  }
-         |  return true;
-         |}
-       """.stripMargin
-    ctx.addNewFunction(choosePredName, choosePredCode)
+    // Ranks Calculation code:
 
+    // Temp ranks and permutation. We need them in predicates re-sort.
     val temp_permutations = ctx.freshName("temp_p")
-    val tempPerformance = ctx.freshName("tempPerformance")
-
-    // performanceCalc: block of code that calculates predicate performances and do appropriate
-    //                  permutation
-    // scalastyle:off
-    val debugCode = if (debug) {
-      s"""
-         |StringBuilder sb = new StringBuilder();
-         |sb.append("(predicate, rate)\t\t");
-         |for (int i=0; i<${otherPreds.length}; i++)
-         |  sb.append("(" + $permutations[i] + "," + String.format("%.2f",$tempPerformance[i]) + "), ");
-         |System.out.println(sb.toString());
-       """.stripMargin
-    } else ""
-    val debugCodeTemp = if (debug) {
+    val tempRanks = ctx.freshName("tempRanks")
+    // `outputMetrics` and `outputRanks` are blocks of code that will output info about metrics
+    // and ranks in Executors stdouts if verbose is enabled.
+    val outputMetrics = if (verbose) {
       s"""
          |StringBuilder sbT = new StringBuilder();
          |sbT.append("(pred num, seen, cut, avg cost)");
          |for (int i=0; i<${otherPreds.length}; i++)
-         |  sbT.append("\t(" + $permutations[i] + "," + $numSeen[$permutations[i]] + ","
-         |            + $numCut[$permutations[i]] + "," + $cost[$permutations[i]] + "), ");
+         |  sbT.append("\t(" + $permutation[i] + "," + $numSeen[$permutation[i]] + ","
+         |            + $numCut[$permutation[i]] + "," + $cost[$permutation[i]] + "), ");
          |System.out.println(sbT.toString());
        """.stripMargin
     } else ""
-    val performanceCalc =
+    val outputRanks = if (verbose) {
+      s"""
+         |StringBuilder sb = new StringBuilder();
+         |sb.append("(predicate, rate)\t\t");
+         |for (int i=0; i<${otherPreds.length}; i++)
+         |  sb.append("(" + $permutation[i] + "," + String.format("%.2f",$tempRanks[i]) + "), ");
+         |System.out.println(sb.toString());
+       """.stripMargin
+    } else ""
+
+    // ranksCalc: block of code that calculates predicate ranks and do appropriate permutation
+    // scalastyle:off
+    val ranksCalc =
       s"""
          |if ($itsTimeToCalculate && $canCalculate) {
          |  $canCalculate = false;
-         |  // convert costs to average and find max average cost
+         |  ${ctx.registerComment("convert costs to average and find max average cost")}
          |  long max_cost = 0;
          |  for (int i=0; i<${otherPreds.length}; i++) {
          |    $cost[i] /= $numSeen[i];
@@ -246,48 +214,75 @@ case class AdaptiveFilterExec(condition: Expression, child: SparkPlan)
          |      max_cost = $cost[i];
          |  }
          |
-         |  $debugCodeTemp
+         |  $outputMetrics
          |
+         |  ${ctx.registerComment("update ranks")}
          |  int[] $temp_permutations = new int[${otherPreds.length}];
-         |  // update performance
          |  for (int i=0; i<${otherPreds.length}; i++) {
-         |    $performance[i] = $momentum*$performance[i] + (1-$momentum)*($cost[i] / (double) max_cost)*($numSeen[i] / (double) $numCut[i]);
+         |    $ranks[i] = $momentum*$ranks[i] + (1-$momentum)*($cost[i]*$numSeen[i] / (double) max_cost*$numCut[i]);
          |    $numSeen[i] = 1;
          |    $numCut[i] = 1;
          |    $cost[i] = 60;
          |    $temp_permutations[i] = i;
          |  }
-         |  // do permutations based on $performance
-         |  // insertion sort based on $performance, that affects $temp_permutations
-         |  double[] $tempPerformance = new double[${otherPreds.length}];
-         |  $tempPerformance[0] = $performance[0];
+         |
+         |  ${ctx.registerComment("do permutation based on $ranks\n" +
+            "insertion sort based on $ranks, that affects $temp_permutations")}
+         |  double[] $tempRanks = new double[${otherPreds.length}];
+         |  $tempRanks[0] = $ranks[0];
          |  for (int j, i=1; i<${otherPreds.length}; i++) {
-         |    $tempPerformance[i] = $performance[i];
-         |    double x = $tempPerformance[i];
+         |    $tempRanks[i] = $ranks[i];
+         |    double x = $tempRanks[i];
          |    int ix = $temp_permutations[i];
          |    for (j = i - 1; j >= 0; j--)
-         |      if ($tempPerformance[j] > x) {
-         |        $tempPerformance[j + 1] = $tempPerformance[j];
+         |      if ($tempRanks[j] > x) {
+         |        $tempRanks[j + 1] = $tempRanks[j];
          |        $temp_permutations[j + 1] = $temp_permutations[j];
          |      } else break;
          |
-         |    $tempPerformance[j+1] = x;
+         |    $tempRanks[j+1] = x;
          |    $temp_permutations[j+1] = ix;
          |  }
          |
-         |  $permutations = $temp_permutations;
+         |  $permutation = $temp_permutations;
          |
-         |  $debugCode
+         |  $outputRanks
          |  $canCalculate = true;
          |}
        """.stripMargin
     // scalastyle:on
+
+
+    // Predicates evaluation code:
+
+    // `choosePredicate`: function that will evaluate a predicate, based on its argument.
+    //                  e.g. for evaluating second predicate => choosePredicate(1)
+    val choosePredName = ctx.freshName("choosePredicate")
+    val choosePredCode =
+      s"""
+         |private final Boolean $choosePredName(int index) {
+         |  switch (index) {
+         |    ${generatedSeq.zipWithIndex.map { case (predicate, i) =>
+                s"""
+                   |case $i: {
+                   |  $predicate
+                   |  return true;
+                   |}
+               """.stripMargin
+              }.mkString("\n")}
+         |  }
+         |  return true;
+         |}
+       """.stripMargin
+    ctx.addNewFunction(choosePredName, choosePredCode)
 
     // Total block of code in processNext for filter will be a number of if statements that each
     // will call choosePredicate to evaluate all predicates in order based on current permutation.
     // But, we have 2 'modes' for this. Either we collect statistics from current row or not.
     // These 2 cases will be wrapped in an external if statement.
     val permutationsSnap = ctx.freshName("permutationsSnap")
+    val predResult = ctx.freshName("predResult")
+    val continue_flag = ctx.freshName("continue_flag")
     val generatedWithoutCollect =
       generatedSeq.indices.map { i =>
         s"""
@@ -299,24 +294,24 @@ case class AdaptiveFilterExec(condition: Expression, child: SparkPlan)
         s"""
            |$numSeen[$permutationsSnap[$i]] += 1;
            |t0 = System.nanoTime();
-           |predResult = $choosePredName($permutationsSnap[$i]);
+           |$predResult = $choosePredName($permutationsSnap[$i]);
            |$cost[$permutationsSnap[$i]] += System.nanoTime() - t0;
-           |if (!predResult) {
+           |if (!$predResult) {
            |  $numCut[$permutationsSnap[$i]] += 1;
-           |  continue_flag = true;
+           |  $continue_flag = true;
            |//  continue;
            |}
            """.stripMargin
       }.mkString("\n")
     val generated =
       s"""
-         |int[] $permutationsSnap = $permutations;
+         |int[] $permutationsSnap = $permutation;
          |if ($itsTimeToCollect) {
          |  long t0;
-         |  boolean predResult;
-         |  boolean continue_flag = false;
+         |  boolean $predResult;
+         |  boolean $continue_flag = false;
          |  $generatedWithCollect
-         |  if (continue_flag) continue;
+         |  if ($continue_flag) continue;
          |} else {
          |  $generatedWithoutCollect
          |}
@@ -325,7 +320,7 @@ case class AdaptiveFilterExec(condition: Expression, child: SparkPlan)
 
     ctx.currentVars = input
 
-    // `doConsume` comment:
+    // `FilterExec` comment:
     // As for now, we leave independent null checks as they are
     val nullChecks = notNullPreds.zipWithIndex.map { case (c, idx) =>
       if (!generatedIsNotNullChecks(idx)) {
@@ -335,7 +330,7 @@ case class AdaptiveFilterExec(condition: Expression, child: SparkPlan)
       }
     }.mkString("\n")
 
-    // `doConsume` comment:
+    // `FilterExec` comment:
     // Reset the isNull to false for the not-null columns, then the followed operators could
     // generate better code (remove dead branches).
     val resultVars = input.zipWithIndex.map { case (ev, i) =>
@@ -345,9 +340,32 @@ case class AdaptiveFilterExec(condition: Expression, child: SparkPlan)
       ev
     }
 
+    // Input for filter may come either from an InternalRow or from a batch of Rows. In the
+    // first case InternalRow will be local variable and in the second case current index
+    // of batch will be local variable. But, we refer to those variables from a function
+    // outside of normal loop (in `prcessNext`) and we need to make these variables
+    // (either of which) object fields. `prereq` contains the appropriate variable, that
+    // is declared and updated at every iteration.
+    val prereq = {
+      val declared = ctx.mutableStates.map(_._2)
+      val allpossible = input.head.code.split("\n", 3)(1).split(" = ").last.split('.')
+      if (!declared.contains(allpossible(0))) {
+        ctx.addMutableState("InternalRow", allpossible(0), "")
+        allpossible(0)
+      } else {
+        val Pattern = raw"[(](\w.*)[)]".r.unanchored
+        allpossible(1) match {
+          case Pattern(value) =>
+            ctx.addMutableState("int", value, "")
+            value
+          case _ => ""
+        }
+      }
+    }
+
     s"""
        |this.$prereq = $prereq;
-       |$performanceCalc
+       |$ranksCalc
        |$numInputRows++;
        |$generated
        |$nullChecks

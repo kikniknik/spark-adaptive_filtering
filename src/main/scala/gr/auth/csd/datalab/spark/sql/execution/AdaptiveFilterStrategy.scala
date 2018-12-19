@@ -9,6 +9,10 @@ import org.apache.spark.sql.execution.datasources.{DataSourceStrategy, FileSourc
 import org.apache.spark.sql.execution.{SparkPlan, SparkStrategy}
 import org.apache.spark.sql.internal.SQLConf
 
+/**
+  * Catalyst strategy that converts logical Filter to physical AdaptiveFilterExec, instead of FilterExec.
+  * It is meant to be inserted in Spark planner as an external extra Strategy.
+  */
 case class AdaptiveFilterStrategy(conf: SQLConf) extends SparkStrategy{
   override def apply(plan: LogicalPlan): Seq[SparkPlan] = {
     val adaptiveFilterEnabled = SparkEnv.get.conf.getBoolean("spark.sql.adaptiveFilter.enabled", true)
@@ -21,6 +25,11 @@ case class AdaptiveFilterStrategy(conf: SQLConf) extends SparkStrategy{
           gr.auth.csd.datalab.spark.sql
             .execution.AdaptiveFilterExec(f.typedCondition(f.deserializer), planLater(f.child)) :: Nil
         case PhysicalOperation(_) =>
+          // There are some Strategies (eg `FileSourceStrategy`, `InMemoryScans`, etc) that can see a
+          // parental to a filter physical operator (like a Project) in the plan tree and they convert
+          // logical Projects to physical `ProjectExec` and logical Filters to physical `FilterExec`.
+          // We run them here in advance and later we convert `FilterExec` to `AdaptiveFilterExec` with
+          // `convertFilterExecToAdaptive` method.
           val fsStrategies = FileSourceStrategy(plan).map(convertFilterExecToAdaptive)
           if (fsStrategies.isEmpty) {
             DataSourceStrategy(conf)(plan).map(convertFilterExecToAdaptive)
@@ -34,6 +43,9 @@ case class AdaptiveFilterStrategy(conf: SQLConf) extends SparkStrategy{
     }
   }
 
+  /**
+    * It converts all `FilterExec` operators of a `SparkPlan` to `AdaptiveFilterExec`.
+    */
   def convertFilterExecToAdaptive(sparkPlan: SparkPlan): SparkPlan = sparkPlan match {
     case execution.ProjectExec(condition, child) =>
       execution.ProjectExec(condition, convertFilterExecToAdaptive(child))
