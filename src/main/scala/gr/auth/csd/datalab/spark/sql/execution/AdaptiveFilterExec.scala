@@ -3,7 +3,7 @@ package gr.auth.csd.datalab.spark.sql.execution
 import org.apache.spark.SparkEnv
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.expressions.codegen.{CodegenContext, ExprCode, ExpressionCanonicalizer}
+import org.apache.spark.sql.catalyst.expressions.codegen.{CodegenContext, ExprCode, ExpressionCanonicalizer, FalseLiteral}
 import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeSet, BindReferences, Expression, IsNotNull, NullIntolerant, PredicateHelper, SortOrder}
 import org.apache.spark.sql.catalyst.plans.physical.Partitioning
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
@@ -146,31 +146,30 @@ case class AdaptiveFilterExec(condition: Expression, child: SparkPlan)
     //                 ranks at that moment
     // `ranks` and `permutation` are static, which means they are shared among all Tasks in an Executor.
     // We do it like that so that new Tasks won't have to start from zero in metrics.
-    val numInputRows = ctx.freshName("numInputRows")
-    val numSeen = ctx.freshName("numSeen")
-    val numCut = ctx.freshName("numCut")
-    val cost = ctx.freshName("cost")
+    val numInputRows = ctx.addMutableState("long", "numInputRows", v => s"$v = 0;")
+    val numSeen = ctx.addMutableState("long[]", "numSeen",
+      v => s"$v = new long[]{${Array.fill(otherPreds.length)(1).mkString(", ")}};")
+    val numCut = ctx.addMutableState("long[]", "numCut",
+      v => s"$v = new long[]{${Array.fill(otherPreds.length)(1).mkString(", ")}};")
+    val cost = ctx.addMutableState("long[]", "cost",
+      v => s"$v = new long[]{${Array.fill(otherPreds.length)(60).mkString(", ")}};")
     val ranks = ctx.freshName("ranks")
     val permutation = ctx.freshName("p")
 
-    ctx.addMutableState("long", numInputRows, s"$numInputRows = 0;")
-    ctx.addMutableState("long[]", numSeen,
-      s"$numSeen = new long[]{${Array.fill(otherPreds.length)(1).mkString(", ")}};")
-    ctx.addMutableState("long[]", numCut,
-      s"$numCut = new long[]{${Array.fill(otherPreds.length)(1).mkString(", ")}};")
-    ctx.addMutableState("long[]", cost,
-      s"$cost = new long[]{${Array.fill(otherPreds.length)(60).mkString(", ")}};")
     ctx.addMutableState("static double[]",
-      s"$ranks = new double[]{${Array.fill(otherPreds.length)(0).mkString(", ")}};", "")
+      s"$ranks = new double[]{${Array.fill(otherPreds.length)(0).mkString(", ")}};",
+      forceInline = true, useFreshName = false)
     ctx.addMutableState("static int[]",
-      s"$permutation = new int[]{${otherPreds.indices.mkString(", ")}};", "")
+      s"$permutation = new int[]{${otherPreds.indices.mkString(", ")}};",
+      forceInline = true, useFreshName = false)
 
     // collect, calculate ranks rates
     val itsTimeToCalculate = s"$numInputRows % $calculateRate == ${30*collectRate}"
     val itsTimeToCollect = s"$numInputRows % $collectRate == 0"
     // `canCalculate`: a lock for preventing Tasks to conflict in ranks calculations
     val canCalculate = ctx.freshName("canCalculate")
-    ctx.addMutableState("static boolean", s"$canCalculate = true;", "")
+    ctx.addMutableState("static boolean", s"$canCalculate = true;",
+      forceInline = true, useFreshName = false)
 
 
     // Ranks Calculation code:
@@ -335,7 +334,7 @@ case class AdaptiveFilterExec(condition: Expression, child: SparkPlan)
     // generate better code (remove dead branches).
     val resultVars = input.zipWithIndex.map { case (ev, i) =>
       if (notNullAttributes.contains(child.output(i).exprId)) {
-        ev.isNull = "false"
+        ev.isNull = FalseLiteral
       }
       ev
     }
@@ -347,19 +346,15 @@ case class AdaptiveFilterExec(condition: Expression, child: SparkPlan)
     // (either of which) object fields. `prereq` contains the appropriate variable, that
     // is declared and updated at every iteration.
     val prereq = {
-      val declared = ctx.mutableStates.map(_._2)
-      val allpossible = input.head.code.split("\n", 3)(1).split(" = ").last.split('.')
-      if (!declared.contains(allpossible(0))) {
-        ctx.addMutableState("InternalRow", allpossible(0), "")
-        allpossible(0)
-      } else {
-        val Pattern = raw"[(](\w.*)[)]".r.unanchored
-        allpossible(1) match {
-          case Pattern(value) =>
-            ctx.addMutableState("int", value, "")
-            value
-          case _ => ""
-        }
+      val allpossible = input.head.code.code.split("\n", 3)(1).split(" = ").last.split('.')
+      val Pattern = raw"[(]([a-z].*)[)]".r.unanchored
+      allpossible(1) match {
+        case Pattern(value) =>
+          ctx.addMutableState("int", value, forceInline = true, useFreshName = false)
+          value
+        case _ =>
+          ctx.addMutableState("InternalRow", allpossible(0), forceInline = true, useFreshName = false)
+          allpossible(0)
       }
     }
 

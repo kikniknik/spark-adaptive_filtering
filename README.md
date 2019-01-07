@@ -43,7 +43,7 @@ sbt clean package
 
 Start Spark shell/submit adding the generated package and the following extension injector:
 ```
-$SPARK_HOME/bin/spark-shell --jars target/scala-2.11/spark-adaptive_filtering_2.11-0.1-SNAPSHOT.jar \
+$SPARK_HOME/bin/spark-shell --jars target/scala-2.11/spark-adaptive_filtering_2.11-0.4-SNAPSHOT.jar \
 --conf "spark.sql.extensions=gr.auth.csd.datalab.spark.sql.AdaptiveFilterExtensionInjector" \
 # set master and other configurations...
 ```

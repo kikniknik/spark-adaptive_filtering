@@ -5,8 +5,9 @@ import org.apache.spark.sql.catalyst.planning.PhysicalOperation
 import org.apache.spark.sql.catalyst.plans.logical
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.execution
+import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Strategy
 import org.apache.spark.sql.execution.datasources.{DataSourceStrategy, FileSourceStrategy}
-import org.apache.spark.sql.execution.{SparkPlan, SparkStrategy}
+import org.apache.spark.sql.execution.{SparkPlan, SparkPlanner, SparkStrategy}
 import org.apache.spark.sql.internal.SQLConf
 
 /**
@@ -30,12 +31,8 @@ case class AdaptiveFilterStrategy(conf: SQLConf) extends SparkStrategy{
           // logical Projects to physical `ProjectExec` and logical Filters to physical `FilterExec`.
           // We run them here in advance and later we convert `FilterExec` to `AdaptiveFilterExec` with
           // `convertFilterExecToAdaptive` method.
-          val fsStrategies = FileSourceStrategy(plan).map(convertFilterExecToAdaptive)
-          if (fsStrategies.isEmpty) {
-            DataSourceStrategy(conf)(plan).map(convertFilterExecToAdaptive)
-          } else {
-            fsStrategies
-          }
+          val dsStrategies = DataSourceV2Strategy :: FileSourceStrategy :: DataSourceStrategy(conf) :: new SparkPlanner(null, null, null).InMemoryScans :: Nil
+          dsStrategies.flatMap(_(plan)).map(convertFilterExecToAdaptive)
         case _ => Nil
       }
     } else {
