@@ -1,7 +1,7 @@
 package gr.auth.csd.datalab.spark.examples
 
 import org.apache.spark.sql.SparkSession
-import org.apache.spark.sql.functions.length
+import org.apache.spark.sql.functions.locate
 
 object AdaptiveFilteringExample {
   def main(args: Array[String]): Unit = {
@@ -20,14 +20,13 @@ object AdaptiveFilteringExample {
 
     import spark.implicits._
 
-    // Following dataframe is a tiny sample of 1-gram dataset.
-    // Find it here: https://storage.googleapis.com/books/ngrams/books/datasetsv2.html
-    val df = Seq(("Chaiton",1991,1,1), ("Alcazaba",1962,3,2), ("BRACHIAL",1856,16,16))
-      .toDF("gram", "year", "times", "books")
+    val df = spark.read.option("sep", ";").option("header", "true").option("inferSchema", "true")
+      .csv("src/main/resources/people.csv")
+    df.show()
 
-    val dff = df.filter(length('gram) < 4 && 'books > 0 && 'year > 1900 && 'times > 200)
+    val dff = df.filter(locate("B", 'name) === 1 && 'age > 30 && locate("Developer", 'job) === 1)
 
-    println(dff.count)
+    dff.show()
     dff.explain()  // You should see AdaptiveFilter operator in Physical Plan.
 
     spark.stop()
