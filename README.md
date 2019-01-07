@@ -32,18 +32,18 @@ Executors act separately, so that each one keeps its own statistics and predicat
 
 ## Usage
 
-Use this extension with a Spark 2.2.2 installation.
+You can use this extension with a Spark 2.x installation. Use version 0.2 (branch-2.2) for Spark versions prior to 2.3 and version 0.4 (branch-2.4) for Spark versions 2.3, 2.4.
 
 Download and build:
 ```
-git clone https://github.com/kikniknik/spark-adaptive_filtering
-cd spark-adaptive_filtering
-sbt clean package
+$ git clone https://github.com/kikniknik/spark-adaptive_filtering
+$ cd spark-adaptive_filtering
+$ sbt clean package
 ```
 
 Start Spark shell/submit adding the generated package and the following extension injector:
 ```
-$SPARK_HOME/bin/spark-shell --jars target/scala-2.11/spark-adaptive_filtering_2.11-0.4-SNAPSHOT.jar \
+$ $SPARK_HOME/bin/spark-shell --jars target/scala-2.11/spark-adaptive_filtering_2.11-0.4-SNAPSHOT.jar \
 --conf "spark.sql.extensions=gr.auth.csd.datalab.spark.sql.AdaptiveFilterExtensionInjector" \
 # set master and other configurations...
 ```
