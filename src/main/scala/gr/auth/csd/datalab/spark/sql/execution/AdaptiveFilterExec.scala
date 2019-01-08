@@ -219,7 +219,7 @@ case class AdaptiveFilterExec(condition: Expression, child: SparkPlan)
          |  ${ctx.registerComment("update ranks")}
          |  int[] $temp_permutations = new int[${otherPreds.length}];
          |  for (int i=0; i<${otherPreds.length}; i++) {
-         |    $ranks[i] = $momentum*$ranks[i] + (1-$momentum)*($cost[i]*$numSeen[i] / (double) max_cost*$numCut[i]);
+         |    $ranks[i] = $momentum*$ranks[i] + (1-$momentum)*($cost[i]*$numSeen[i] / ((double) max_cost*$numCut[i]));
          |    $numSeen[i] = 1;
          |    $numCut[i] = 1;
          |    $cost[i] = 60;
